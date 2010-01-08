@@ -728,7 +728,7 @@ struct event_base;
    of execution.
  */
 int evbuffer_defer_callbacks(struct evbuffer *buffer, struct event_base *base);
-
+    
 #ifdef __cplusplus
 }
 #endif

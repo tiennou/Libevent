@@ -1,0 +1,35 @@
+implemented read methods
+  readv
+  recv
+  Win: WSARecv
+  Win: read
+implemented write methods
+  sendfile/mmap
+  writev
+  send
+  Win: WSASend
+  Win: write
+
+Does Win iovec supports sockaddr ?
+
+pread => fd
+read => fd, conn_sock
+readv => fd, conn_sock, iovec
+recv => fd, conn_sock
+recvfrom => fd, conn_sock, sock
+recvmsg => fd, conn_sock, sock, iovec
+pwrite => fd
+write => fd, conn_sock
+writev => fd, conn_sock, iovec
+send => fd, conn_sock
+sendmsg => fd, conn_sock, sock, iovec
+sendto => fd, conn_sock, sock
+sendfile => sock
+
+my new evbuffer_read uses FIONREAD, then call cb
+
+to choose a cb implementation
+when fd is set, evbuffer flags are added to describe the fd
+sendfile is used if the socket is connected and the buffer is EVBUFFER_SENDFILE'd
+iovec can always be used (check Win)
+then will need to check performance of each method to prioritize them correctly

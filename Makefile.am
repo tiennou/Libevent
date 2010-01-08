@@ -163,7 +163,7 @@ BUILT_SOURCES = ./include/event2/event-config.h
 CORE_SRC = event.c evthread.c buffer.c \
 	bufferevent.c bufferevent_sock.c bufferevent_filter.c \
 	bufferevent_pair.c listener.c bufferevent_ratelim.c \
-	evmap.c	log.c evutil.c evutil_rand.c strlcpy.c $(SYS_SRC)
+	evmap.c	log.c evutil.c evutil_rand.c evsocket.c strlcpy.c $(SYS_SRC)
 EXTRA_SRC = event_tagging.c http.c evdns.c evrpc.c
 
 if BUILD_WIN32

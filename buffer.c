@@ -78,6 +78,7 @@
 
 #include "event2/event.h"
 #include "event2/buffer.h"
+#include "event2/evsocket.h"
 #include "event2/buffer_compat.h"
 #include "event2/bufferevent.h"
 #include "event2/bufferevent_compat.h"
@@ -96,21 +97,6 @@
 #define MAP_FAILED	((void *)-1)
 #endif
 
-/* send file support */
-#if defined(_EVENT_HAVE_SYS_SENDFILE_H) && defined(_EVENT_HAVE_SENDFILE) && defined(__linux__)
-#define USE_SENDFILE		1
-#define SENDFILE_IS_LINUX	1
-#elif defined(_EVENT_HAVE_SENDFILE) && defined(__FreeBSD__)
-#define USE_SENDFILE		1
-#define SENDFILE_IS_FREEBSD	1
-#elif defined(_EVENT_HAVE_SENDFILE) && defined(__APPLE__)
-#define USE_SENDFILE		1
-#define SENDFILE_IS_MACOSX	1
-#elif defined(_EVENT_HAVE_SENDFILE) && defined(__sun__) && defined(__svr4__)
-#define USE_SENDFILE		1
-#define SENDFILE_IS_SOLARIS	1
-#endif
-
 #ifdef USE_SENDFILE
 static int use_sendfile = 1;
 #endif
@@ -127,11 +113,6 @@ static int use_mmap = 1;
 /* Flag set if the callback is using the cb_obsolete function pointer  */
 #define EVBUFFER_CB_OBSOLETE	       0x00040000
 
-/* evbuffer_chain support */
-#define CHAIN_SPACE_PTR(ch) ((ch)->buffer + (ch)->misalign + (ch)->off)
-#define CHAIN_SPACE_LEN(ch) ((ch)->flags & EVBUFFER_IMMUTABLE ? \
-	    0 : (ch)->buffer_len - ((ch)->misalign + (ch)->off))
-
 #define CHAIN_PINNED(ch)  (((ch)->flags & EVBUFFER_MEM_PINNED_ANY) != 0)
 #define CHAIN_PINNED_R(ch)  (((ch)->flags & EVBUFFER_MEM_PINNED_R) != 0)
 
@@ -139,8 +120,6 @@ static void evbuffer_chain_align(struct evbuffer_chain *chain);
 static void evbuffer_deferred_callback(struct deferred_cb *cb, void *arg);
 static int evbuffer_ptr_memcmp(const struct evbuffer *buf,
     const struct evbuffer_ptr *pos, const char *mem, size_t len);
-static struct evbuffer_chain *evbuffer_expand_singlechain(struct evbuffer *buf,
-    size_t datlen);
 
 #ifdef WIN32
 static int evbuffer_readfile(struct evbuffer *buf, evutil_socket_t fd,
@@ -1640,7 +1619,7 @@ evbuffer_chain_align(struct evbuffer_chain *chain)
 
 /* Expands the available space in the event buffer to at least datlen, all in
  * a single chunk.  Return that chunk. */
-static struct evbuffer_chain *
+struct evbuffer_chain *
 evbuffer_expand_singlechain(struct evbuffer *buf, size_t datlen)
 {
 	struct evbuffer_chain *chain, **chainp;
@@ -1872,44 +1851,6 @@ evbuffer_expand(struct evbuffer *buf, size_t datlen)
 	return chain ? 0 : -1;
 }
 
-/*
- * Reads data from a file descriptor into a buffer.
- */
-
-#if defined(_EVENT_HAVE_SYS_UIO_H) || defined(WIN32)
-#define USE_IOVEC_IMPL
-#endif
-
-#ifdef USE_IOVEC_IMPL
-
-#ifdef _EVENT_HAVE_SYS_UIO_H
-/* number of iovec we use for writev, fragmentation is going to determine
- * how much we end up writing */
-
-#define DEFAULT_WRITE_IOVEC 128
-
-#if defined(UIO_MAXIOV) && UIO_MAXIOV < DEFAULT_WRITE_IOVEC
-#define NUM_WRITE_IOVEC UIO_MAXIOV
-#elif defined(IOV_MAX) && IOV_MAX < DEFAULT_WRITE_IOVEC
-#define NUM_WRITE_IOVEC IOV_MAX
-#else
-#define NUM_WRITE_IOVEC DEFAULT_WRITE_IOVEC
-#endif
-
-#define IOV_TYPE struct iovec
-#define IOV_PTR_FIELD iov_base
-#define IOV_LEN_FIELD iov_len
-#else
-#define NUM_WRITE_IOVEC 16
-#define IOV_TYPE WSABUF
-#define IOV_PTR_FIELD buf
-#define IOV_LEN_FIELD len
-#endif
-#endif
-#define NUM_READ_IOVEC 4
-
-#define EVBUFFER_MAX_READ	4096
-
 /** Helper function to figure out which space to use for reading data into
     an evbuffer.  Internal use only.
 
@@ -1979,22 +1920,15 @@ get_n_bytes_readable_on_socket(evutil_socket_t fd)
 
 /* TODO(niels): should this function return ev_ssize_t and take ev_ssize_t
  * as howmuch? */
+/**
+ * Reads data from a file descriptor into a buffer.
+ */
 int
 evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 {
-	struct evbuffer_chain *chain, **chainp;
-	int n;
-	int result;
-
-#ifdef USE_IOVEC_IMPL
-	int nvecs, i, remaining;
-#else
-	unsigned char *p;
-#endif
-
-	EVBUFFER_LOCK(buf);
-
-	chain = buf->last;
+    int result;
+    int n = EVBUFFER_MAX_READ;
+    EVBUFFER_LOCK(buf);
 
 	if (buf->freeze_end) {
 		result = -1;
@@ -2007,99 +1941,47 @@ evbuffer_read(struct evbuffer *buf, evutil_socket_t fd, int howmuch)
 	if (howmuch < 0 || howmuch > n)
 		howmuch = n;
 
+    if (buf->read_cb != NULL) {
+        n = buf->read_cb(buf, fd, howmuch);
+    } else {
+        int type = evsocket_type(fd);
+        switch (type) {
+            case SOCK_DGRAM:
 #ifdef USE_IOVEC_IMPL
-	/* Since we can use iovecs, we're willing to use the last
-	 * NUM_READ_IOVEC chains. */
-	if (_evbuffer_expand_fast(buf, howmuch, NUM_READ_IOVEC) == -1) {
-		result = -1;
-		goto done;
-	} else {
-		IOV_TYPE vecs[NUM_READ_IOVEC];
-#ifdef _EVBUFFER_IOVEC_IS_NATIVE
-		nvecs = _evbuffer_read_setup_vecs(buf, howmuch, vecs,
-		    NUM_READ_IOVEC, &chainp, 1);
+                n = evsocket_recvmsg(buf, fd, howmuch);
 #else
-		/* We aren't using the native struct iovec.  Therefore,
-		   we are on win32. */
-		struct evbuffer_iovec ev_vecs[NUM_READ_IOVEC];
-		nvecs = _evbuffer_read_setup_vecs(buf, howmuch, ev_vecs, 2,
-		    &chainp, 1);
-
-		for (i=0; i < nvecs; ++i)
-			WSABUF_FROM_EVBUFFER_IOV(&vecs[i], &ev_vecs[i]);
+                n = evsocket_recvfrom(buf, fd, howmuch);
 #endif
-
-#ifdef WIN32
-		{
-			DWORD bytesRead;
-			DWORD flags=0;
-			if (WSARecv(fd, vecs, nvecs, &bytesRead, &flags, NULL, NULL)) {
-				/* The read failed. It might be a close,
-				 * or it might be an error. */
-				if (WSAGetLastError() == WSAECONNABORTED)
-					n = 0;
-				else
-					n = -1;
-			} else
-				n = bytesRead;
-		}
-#else
-		n = readv(fd, vecs, nvecs);
-#endif
-	}
-
-#else /*!USE_IOVEC_IMPL*/
-	/* If we don't have FIONREAD, we might waste some space here */
-	/* XXX we _will_ waste some space here if there is any space left
-	 * over on buf->last. */
-	if ((chain = evbuffer_expand_singlechain(buf, howmuch)) == NULL) {
-		result = -1;
-		goto done;
-	}
-
-	/* We can append new data at this point */
-	p = chain->buffer + chain->misalign + chain->off;
-
-#ifndef WIN32
-	n = read(fd, p, howmuch);
-#else
-	n = recv(fd, p, howmuch, 0);
-#endif
-#endif /* USE_IOVEC_IMPL */
-
-	if (n == -1) {
-		result = -1;
-		goto done;
-	}
-	if (n == 0) {
-		result = 0;
-		goto done;
-	}
-
+                break;
+            case SOCK_STREAM:
 #ifdef USE_IOVEC_IMPL
-	remaining = n;
-	for (i=0; i < nvecs; ++i) {
-		ev_ssize_t space = CHAIN_SPACE_LEN(*chainp);
-		if (space < remaining) {
-			(*chainp)->off += space;
-			remaining -= space;
-		} else {
-			(*chainp)->off += remaining;
-			buf->last_with_datap = chainp;
-			break;
-		}
-		chainp = &(*chainp)->next;
-	}
+                n = evsocket_readv(buf, fd, howmuch);
 #else
-	chain->off += n;
-	advance_last_with_data(buf);
+                n = evsocket_recv(buf, fd, howmuch);
 #endif
-	buf->total_len += n;
-	buf->n_add_for_cb += n;
+                break;
 
-	/* Tell someone about changes in this buffer */
-	evbuffer_invoke_callbacks(buf);
-	result = n;
+            default:
+                /* XXX : unexpected */
+                break;
+        }
+    }
+
+    /* need to check that buffer/chain size is correct */
+    if (n == -1) {
+        result = -1;
+        goto done;
+    }
+    if (n == 0) {
+        result = 0;
+        goto done;
+    }
+    buf->total_len += n;
+    buf->n_add_for_cb += n;
+
+    /* Tell someone about changes in this buffer */
+    evbuffer_invoke_callbacks(buf);
+    result = n;
 done:
 	EVBUFFER_UNLOCK(buf);
 	return result;
@@ -2153,101 +2035,6 @@ done:
 	EVBUFFER_UNLOCK(buf);
 	return result;
 }
-#endif
-
-#ifdef USE_IOVEC_IMPL
-static inline int
-evbuffer_write_iovec(struct evbuffer *buffer, evutil_socket_t fd,
-    ev_ssize_t howmuch)
-{
-	IOV_TYPE iov[NUM_WRITE_IOVEC];
-	struct evbuffer_chain *chain = buffer->first;
-	int n, i = 0;
-
-	if (howmuch < 0)
-		return -1;
-
-	ASSERT_EVBUFFER_LOCKED(buffer);
-	/* XXX make this top out at some maximal data length?  if the
-	 * buffer has (say) 1MB in it, split over 128 chains, there's
-	 * no way it all gets written in one go. */
-	while (chain != NULL && i < NUM_WRITE_IOVEC && howmuch) {
-#ifdef USE_SENDFILE
-		/* we cannot write the file info via writev */
-		if (chain->flags & EVBUFFER_SENDFILE)
-			break;
-#endif
-		iov[i].IOV_PTR_FIELD = (void *) (chain->buffer + chain->misalign);
-		if ((size_t)howmuch >= chain->off) {
-			iov[i++].IOV_LEN_FIELD = chain->off;
-			howmuch -= chain->off;
-		} else {
-			iov[i++].IOV_LEN_FIELD = howmuch;
-			break;
-		}
-		chain = chain->next;
-	}
-#ifdef WIN32
-	{
-		DWORD bytesSent;
-		if (WSASend(fd, iov, i, &bytesSent, 0, NULL, NULL))
-			n = -1;
-		else
-			n = bytesSent;
-	}
-#else
-	n = writev(fd, iov, i);
-#endif
-	return (n);
-}
-#endif
-
-#ifdef USE_SENDFILE
-static inline int
-evbuffer_write_sendfile(struct evbuffer *buffer, evutil_socket_t fd,
-    ev_ssize_t howmuch)
-{
-	struct evbuffer_chain *chain = buffer->first;
-	struct evbuffer_chain_fd *info =
-	    EVBUFFER_CHAIN_EXTRA(struct evbuffer_chain_fd, chain);
-#if defined(SENDFILE_IS_MACOSX) || defined(SENDFILE_IS_FREEBSD)
-	int res;
-	off_t len = chain->off;
-#elif defined(SENDFILE_IS_LINUX) || defined(SENDFILE_IS_SOLARIS)
-	ev_ssize_t res;
-	off_t offset = chain->misalign;
-#endif
-
-	ASSERT_EVBUFFER_LOCKED(buffer);
-
-#if defined(SENDFILE_IS_MACOSX)
-	res = sendfile(info->fd, fd, chain->misalign, &len, NULL, 0);
-	if (res == -1 && !EVUTIL_ERR_RW_RETRIABLE(errno))
-		return (-1);
-
-	return (len);
-#elif defined(SENDFILE_IS_FREEBSD)
-	res = sendfile(info->fd, fd, chain->misalign, chain->off, NULL, &len, 0);
-	if (res == -1 && !EVUTIL_ERR_RW_RETRIABLE(errno))
-		return (-1);
-
-	return (len);
-#elif defined(SENDFILE_IS_LINUX)
-	/* TODO(niels): implement splice */
-	res = sendfile(fd, info->fd, &offset, chain->off);
-	if (res == -1 && EVUTIL_ERR_RW_RETRIABLE(errno)) {
-		/* if this is EAGAIN or EINTR return 0; otherwise, -1 */
-		return (0);
-	}
-	return (res);
-#elif defined(SENDFILE_IS_SOLARIS)
-	res = sendfile(fd, info->fd, &offset, chain->off);
-	if (res == -1 && EVUTIL_ERR_RW_RETRIABLE(errno)) {
-		/* if this is EAGAIN or EINTR return 0; otherwise, -1 */
-		return (0);
-	}
-	return (res);
-#endif
 }
 #endif
 
@@ -2270,24 +2057,39 @@ evbuffer_write_atmost(struct evbuffer *buffer, evutil_socket_t fd,
 #ifdef USE_SENDFILE
 		struct evbuffer_chain *chain = buffer->first;
 		if (chain != NULL && (chain->flags & EVBUFFER_SENDFILE))
-			n = evbuffer_write_sendfile(buffer, fd, howmuch);
-		else {
+			n = evsocket_sendfile(buffer, fd, howmuch);
+		else
 #endif
+        if (buffer->write_cb != NULL) {
+            n = buffer->write_cb(buffer, fd, howmuch);
+        } else {
+            int type = evsocket_type(fd);
+            switch (type) {
+                case SOCK_DGRAM:
 #ifdef USE_IOVEC_IMPL
-		n = evbuffer_write_iovec(buffer, fd, howmuch);
-#elif defined(WIN32)
-		/* XXX(nickm) Don't disable this code until we know if
-		 * the WSARecv code above works. */
-		void *p = evbuffer_pullup(buffer, howmuch);
-		n = send(fd, p, howmuch, 0);
+                    n = evsocket_sendmsg(buffer, fd, howmuch);
 #else
-		void *p = evbuffer_pullup(buffer, howmuch);
-		n = write(fd, p, howmuch);
+                    n = evsocket_sendto(buffer, fd, howmuch);
 #endif
-#ifdef USE_SENDFILE
-		}
+                    break;
+                case SOCK_STREAM:
+#ifdef USE_IOVEC_IMPL
+                    n = evsocket_writev(buffer, fd, howmuch);
+#elif defined(WIN32)
+                    /* XXX(nickm) Don't disable this code until we know if
+                     * the WSARecv code above works. */
+                    n = evsocket_send(buffer, fd, howmuch);
+#else
+                    n = evsocket_write(buffer, fd, howmuch);
 #endif
-	}
+                    break;
+
+                default:
+                    /* XXX : unexpected */
+                    break;
+            }
+        }
+    }
 
 	if (n > 0)
 		evbuffer_drain(buffer, n);

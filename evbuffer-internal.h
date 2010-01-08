@@ -32,6 +32,7 @@ extern "C" {
 #endif
 
 #include "event2/event-config.h"
+#include "event2/evsocket.h"
 #include "event2/util.h"
 #include "util-internal.h"
 #include "defer-internal.h"
@@ -54,6 +55,14 @@ extern "C" {
 #else
 #define MIN_BUFFER_SIZE	1024
 #endif
+
+/* maximum amount of data read/written */
+#define EVBUFFER_MAX_READ 4096
+
+/* evbuffer_chain support */
+#define CHAIN_SPACE_PTR(ch) ((ch)->buffer + (ch)->misalign + (ch)->off)
+#define CHAIN_SPACE_LEN(ch) ((ch)->flags & EVBUFFER_IMMUTABLE ? \
+0 : (ch)->buffer_len - ((ch)->misalign + (ch)->off))
 
 /** A single evbuffer callback for an evbuffer. This function will be invoked
  * when bytes are added to or removed from the evbuffer. */
@@ -129,6 +138,19 @@ struct evbuffer {
 	/** True iff this buffer is set up for overlapped IO. */
 	unsigned is_overlapped : 1;
 #endif
+
+    /** Callback used for reading from the descriptor
+     * NULL means use default implementation
+     */
+    evsocket_cb read_cb;
+
+    /** Callback used for writing to the descriptor
+     * NULL means use default implementation
+     */
+    evsocket_cb write_cb;
+
+    /** "Metadata" associated with the previous read or next write */
+    struct evsocket_info *info;
 
 	/** Used to implement deferred callbacks. */
 	struct deferred_cb_queue *cb_queue;
@@ -267,6 +289,8 @@ int _evbuffer_read_setup_vecs(struct evbuffer *buf, ev_ssize_t howmuch,
 
 /** Set the parent bufferevent object for buf to bev */
 void evbuffer_set_parent(struct evbuffer *buf, struct bufferevent *bev);
+
+struct evbuffer_chain *evbuffer_expand_singlechain(struct evbuffer *buf, size_t datlen);
 
 #ifdef __cplusplus
 }

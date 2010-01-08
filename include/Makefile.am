@@ -13,6 +13,7 @@ EVENT2_EXPORT = \
 	event2/event.h \
 	event2/event_compat.h \
 	event2/event_struct.h \
+	event2/evsocket.h \
 	event2/http.h \
 	event2/http_compat.h \
 	event2/http_struct.h \
