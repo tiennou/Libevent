@@ -345,7 +345,7 @@ new_accepting_socket(struct evconnlistener_iocp *lev, int family)
 	event_deferred_cb_init(&res->deferred,
 		accepted_socket_invoke_user_cb, res);
 
-	InitializeCriticalSection(&res->lock);
+	InitializeCriticalSectionAndSpinCount(&res->lock, 1000);
 
 	return res;
 }
@@ -590,7 +590,7 @@ evconnlistener_new_async(struct event_base *base,
 	if (event_iocp_port_associate(lev->port, fd, 1) < 0)
 		goto err_free_lev;
 
-	InitializeCriticalSection(&lev->lock);
+	InitializeCriticalSectionAndSpinCount(&lev->lock, 1000);
 
 	lev->n_accepting = N_SOCKETS_PER_LISTENER;
 	lev->accepting = mm_calloc(lev->n_accepting,
